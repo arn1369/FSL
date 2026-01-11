@@ -8,12 +8,12 @@ Implementing Sheaf Neural Networks with HMM to model market as a dynamic topolog
     We don't use homology, because there isn't a cup product -> better structure.
     So why $H¹$ instead of other cohomology space $H^k$ ?
     $H⁰$ is the "Beta". When everything goes up, $H⁰$ is high. Bad for alpha.
-    $H¹$ is the obstruction to global coherence. Locally, the cycles runs, but globally, we get an impossible cycle -> anomaly (structural "stress")
+    $H¹$ is the obstruction to global coherence. Locally, the cycles run, but globally, we get an impossible cycle -> anomaly (structural "stress")
     $H²$ is superior order incoherence. Hard to interpret, and it takes a lot of computational workload ($O(N³)$) !
 
     So we have our $H¹$, the cohomology score, an indicator of structural (systemic) stress.
     When :
-        1) $H¹\approx 0$ -> Coherent market (cycles are stables)
+        1) $H¹\approx 0$ -> Coherent market (cycles are stable)
         2) $H¹ >> 0$ -> Incoherent market (cycles are distorted)
 
     So let's use $H¹$ instead of volatility to find the right regime !
@@ -25,7 +25,7 @@ Implementing Sheaf Neural Networks with HMM to model market as a dynamic topolog
     Also, in HMM, we implemented inertia to avoid that the model changes too fast of opinion (avoid whipsaw). The HMM is also useful to change some investment parameters like leverage, long/short, etc.
 
 3. Why Functorial Sheaf Learning ?
-    Unlike other models, Sheaf Neural Network uses linear applications to explain different states. This is used to model more complex relations, and to explain them ! We can invert, rotate, unphase, linear applications ! It gives the keys to translate APPL to MFST (sort of), instead of only showing the correlation (like GNN or smth else).
+    Unlike other models, Sheaf Neural Network uses linear applications to explain different states. This is used to model more complex relations, and to explain them ! We can invert, rotate, unphase, linear applications ! It gives the keys to translate APPL to MSFT (sort of), instead of only showing the correlation (like GNN or smth else).
 
     The functorial part is useful to keep the topological structure between layers. In classical neural networks, geometrical structure is sometimes lost between the layers. So the functorial part is useful to keep the structural interpretability !
 
@@ -58,7 +58,7 @@ The nice thing about FSL is that the model "knows" if he's right or not : we hav
 
 Here, using LSTM is bad because it is difficult to find links between assets, and if the market has a regime change, it fails to adapt quickly. Of course, there exists some adjustments but fundamentally, there is a problem.
 
-Using Transformers here would be hard too, because the transformer would see correlation everywhere, and will hallucinate relations between assets. Moreover, it needs tremandous amount of data to learn !
+Using Transformers here would be hard too, because the transformer would see correlation everywhere, and will hallucinate relations between assets. Moreover, it needs tremendous amount of data to learn !
 
 Here FSL is native multi-assets : the model *is* the graph of relations. Moreover, Transformers and LSTM are black boxes. FSL can be interpreted, we can analyse it's structure and see what goes right/wrong in the market. Additionally, with Sheaf Learning, we prevent the model to learn from bad data. But the thing is that we have a strong assumption : the markets tends to an equilibrium (stable).
 
@@ -81,7 +81,7 @@ The goal is to apply FSL in more domains, notably in medical predictions data.
 7) [SOLVED] Hard scalability on large number of assets (N² restriction matrices). Complexity of $O(N²)$. Here we have 256 matrices (16²). S&P500 : ~250,000 !! We use Multi-head now.
 8) Perpetual fight against trivial collapse, with spectral regularization. For now I don't have this problem, but maybe need to optimize it.
 9) Bad in fast crash (lag of HMM)
-10) With M&A, bad ! -> MFST acquires Activision. Activision will be uncorrelated from the market to align with MSFT. $H¹$ is high and detect risk and shout the crisis.
+10) With M&A, bad ! -> MSFT acquires Activision. Activision will be uncorrelated from the market to align with MSFT. $H¹$ is high and detect risk and shout the crisis.
 11) [SOLVED] Complexity ($O(N²*D²)$ with N number of asset pairs and D feature dimension). Really bad for scaling... Transformer : $O(N²\cdot D)$. A possible solution (need to confirm it with results) would be to restraint assets to "talk" with only it's k neighbors : $O(N\cdot k\cdot D²)$, more viable.
 12) Better README file (finalize using latex for formulas etc) and better in-detail explanations
 
