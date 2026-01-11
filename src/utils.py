@@ -1,3 +1,11 @@
+
+"""
+FSL Implementation
+@author : Arnaud Ullens
+@created :  8th dec.2025
+last modification : 11th jan.2025
+"""
+
 import numpy as np
 import torch
 from torch import nn
@@ -10,9 +18,9 @@ class MultiRegimeHMM:
     def __init__(self, inertia=0.95, init_mean=None, init_var=None):
         self.n_states = 4
         
-        # TRANSITIONS "COLLANTES" (Sticky)
+        # Sticky transitions
         self.trans_prob = np.array([
-            [0.94, 0.04, 0.01, 0.01],  # Crise
+            [0.94, 0.04, 0.01, 0.01],  # Crisis
             [0.05, 0.85, 0.08, 0.02],  # Volatil
             [0.01, 0.05, 0.85, 0.09],  # Normal
             [0.01, 0.04, 0.10, 0.85]   # Bull
@@ -22,11 +30,11 @@ class MultiRegimeHMM:
         self.state_prob = np.array([0.05, 0.15, 0.60, 0.20])
         self.smooth_prob = np.array([0.05, 0.15, 0.60, 0.20])
         
-        # Baseline ancrée (Z-SCORES)
+        # Z-score
         self.means = np.array([3.0, 1.5, 0.0, -0.5]) 
         self.vars = np.array([1.0, 0.8, 0.5, 0.5])
         
-        # EMA pour lisser l'observation
+        # EMA to smooth the observation
         self.ema_signal = None
         self.ema_alpha = 0.2
 
@@ -77,16 +85,20 @@ class RollingWindowDataset(Dataset):
     def __init__(self, dataframe, window_size=20):
         self.data = dataframe.values.astype(np.float32)
         self.window_size = window_size
+        
+        self.scale_factor = 100.0 
+
     def __len__(self):
         return len(self.data) - self.window_size
+
     def __getitem__(self, idx):
         window = self.data[idx : idx + self.window_size]
         target = self.data[idx + self.window_size]
-        mean = window.mean(axis=0, keepdims=True)
-        std = window.std(axis=0, keepdims=True) + 1e-6
-        x_norm = (window - mean) / std
-        x_norm_T = x_norm.T 
-        inputs = [torch.tensor(x_norm_T[i]) for i in range(x_norm_T.shape[0])]
+        
+        # Fix scaling
+        x_norm = window * self.scale_factor
+        
+        inputs = [torch.tensor(x_norm[:, i]) for i in range(x_norm.shape[1])]
         return inputs, torch.tensor(target)
 
 class FSLPredictor(nn.Module):

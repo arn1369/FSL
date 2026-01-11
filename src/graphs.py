@@ -1,6 +1,13 @@
+
+"""
+FSL Implementation
+@author : Arnaud Ullens
+@created :  8th dec.2025
+last modification : 11th jan.2025
+"""
+
 import os
 import matplotlib.pyplot as plt
-import pandas as pd
 import numpy as np
 import pickle
 
@@ -27,7 +34,7 @@ def plot_performance(filename="./saves/backtest_results.pkl"):
                                           gridspec_kw={'height_ratios': [3, 1, 1]})
     
     # 1: P&L
-    ax1.plot(dates, cum_strategy, label='FSL + MultiHMM V3', linewidth=2, color='teal')
+    ax1.plot(dates, cum_strategy, label='FSL + MultiHMM', linewidth=2, color='teal')
     ax1.plot(dates, cum_market, label='Market Benchmark', linestyle='--', color='#1f77b4')
     
     title = f"Strategy: FSL + HMM (Reconstructed Results)\n"

@@ -1,9 +1,16 @@
+
+"""
+FSL Implementation
+@author : Arnaud Ullens
+@created :  8th dec.2025
+last modification : 11th jan.2025
+"""
+
 import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
-import pandas as pd
 import os
 from torch.utils.data import Dataset, DataLoader
 
@@ -13,7 +20,6 @@ def get_universal_data():
     """
     Downloads and cleans S&P 500 data.
     Returns RAW RETURNS.
-    Global normalization is avoided here to prevent Look-Ahead Bias.
     """
     
     print("Downloading Universal Dataset...")
@@ -29,25 +35,20 @@ def get_universal_data():
         "DIS"
     ]
     
-    data = yf.download(tickers, start="2010-01-01", end="2018-12-31", progress=True, auto_adjust=True)
+    data = yf.download(tickers, start="2010-01-01", end="2018-12-31", progress=True, auto_adjust=True)['Close']
+
+    valid_tickers = [t for t in tickers if t in data.columns]
     
-    if isinstance(data.columns, pd.MultiIndex):
-        try:
-            if 'Close' in data.columns.get_level_values(0):
-                df = data['Close']
-            else:
-                df = data.xs('Close', axis=1, level=0)
-        except:
-            print("This isn't supposed to happen.")
-            df = data['Adj Close']
-    else:
-        df = data['Close'] if 'Close' in data.columns else data
+    if len(valid_tickers) < len(tickers):
+        print(f"Warning: {len(tickers) - len(valid_tickers)} tickers failed to download.")
+    
+    data = data[valid_tickers]
 
     # Cleaning Data
-    df = df.dropna(axis=1, thresh=int(len(df)*0.9)) # keep tickers with at least 90% data
-    df = df.ffill().bfill()
+    data = data.dropna(axis=1, thresh=int(len(data)*0.9)) # keep tickers with at least 90% data
+    data = data.ffill().bfill()
     
-    returns = df.pct_change().dropna()
+    returns = data.pct_change().dropna()
     
     print(f"Valid tickers retrieved: {len(returns.columns)}")
     print(f"Data ready. Shape: {returns.shape}")
@@ -56,47 +57,35 @@ def get_universal_data():
 
 class UniversalDataset(Dataset):
     def __init__(self, dataframe, window_size=20, augment=False):
-        """
-        dataframe : DataFrame of RAW returns.
-        """
         self.data = dataframe
         self.window_size = window_size
         self.augment = augment
         self.n_assets = dataframe.shape[1]
-        self.values = dataframe.values 
+        self.values = dataframe.values.astype(np.float32)
 
     def __len__(self):
         return len(self.data) - self.window_size
 
     def __getitem__(self, idx):
-        # Extraction : Get the window and the next value (target)
         raw_window = self.values[idx : idx + self.window_size]
         target = self.values[idx + self.window_size]
         
-        # Instance Normalization: Normalize each window independently (Mean=0, Std=1)
-        # This is crucial for financial data to make it comparable across different volatility regimes.
-        window_mean = np.mean(raw_window, axis=0)
-        window_std = np.std(raw_window, axis=0) + 1e-8
-        normalized_window = (raw_window - window_mean) / window_std
+        # Harmonization with utils.py to avoid Distribution Shift
+        normalized_window = raw_window * 100.0 
         
-        # Augmentation: Add noise during training
+        # Clip for numerical stability
+        normalized_window = np.clip(normalized_window, -5.0, 5.0)
+
         if self.augment:
+            # Reduced noise since the scale is x100
             noise = np.random.normal(0, 0.05, normalized_window.shape)
             normalized_window = normalized_window + noise
 
-        # Tensorization
-        inputs = []
-        for asset_idx in range(self.n_assets):
-            asset_series = normalized_window[:, asset_idx]
-            
-            tensor = torch.tensor(asset_series, dtype=torch.float) 
-            
-            inputs.append(tensor)
-            
+        inputs = [torch.tensor(normalized_window[:, i]) for i in range(self.n_assets)]
         target_tensor = torch.tensor(target, dtype=torch.float)
 
         return inputs, target_tensor
-
+    
 class FSLPredictor(nn.Module):
     """
     Wraps the Hierarchical FSL backbone with a prediction head.

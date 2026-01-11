@@ -1,7 +1,9 @@
 
 """
 FSL Implementation
-@author : Arnaud Ullens on 8th dec.2025
+@author : Arnaud Ullens
+@created :  8th dec.2025
+last modification : 11th jan.2025
 """
 
 import torch
@@ -53,111 +55,118 @@ class SoftOrthogonalRestriction(nn.Module):
         
         return ortho_loss + 0.1 * spectral_reg
 
-
-class DynamicSheafLaplacian(nn.Module):
+class MultiHeadSheafLaplacian(nn.Module):
     """
-    Core Sheaf Diffusion Layer.
-    Learns the topology (adjacency) dynamically and diffuses information 
-    across contexts (nodes) based on restriction maps.
+    Multi-Head FSL & Non-linear projectors (MLPs)
+    Complexity: O(N * d^2) (Linear in N).
     """
-    def __init__(self, n_contexts: int, context_dims: List[int], 
-                 attention_dim: int = 64, alpha: float = 0.5):
+    def __init__(self, n_contexts: int, context_dim: int, latent_dim: int = 16, 
+                 attention_dim: int = 32, n_heads: int = 4):
         super().__init__()
         self.n_contexts = n_contexts
-        self.context_dims = context_dims
+        self.context_dim = context_dim
+        self.total_latent_dim = latent_dim
+        self.n_heads = n_heads
+        self.head_dim = latent_dim // n_heads
         self.attention_dim = attention_dim
         
-        # Adaptive diffusion parameter (learned during training)
+        assert latent_dim % n_heads == 0, "latent_dim must be divisible by n_heads"
+
+        # 1. Local Projectors (Asset-Specific)
+        self.projectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(context_dim, latent_dim),
+                nn.LayerNorm(latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, latent_dim)
+            ) for _ in range(n_contexts)
+        ])
+        
+        # 2. Local Deprojectors (Asset-Specific)
+        # z_global -> x_i_new
+        self.deprojectors = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(latent_dim, latent_dim),
+                nn.GELU(),
+                nn.Linear(latent_dim, context_dim)
+            ) for _ in range(n_contexts)
+        ])
+        
+        # Orthogonal Initialization (to prevent initial collapse)
+        for m in self.projectors: 
+            if isinstance(m, nn.Linear): nn.init.orthogonal_(m.weight)
+        for m in self.deprojectors:
+            if isinstance(m, nn.Linear): nn.init.orthogonal_(m.weight)
+
+        # 3. Multi-Head Linear Attention (Shared Global Dynamics)
+        # Project input to n_heads * attention_dim
+        self.query_proj = nn.Linear(context_dim, n_heads * attention_dim)
+        self.key_proj = nn.Linear(context_dim, n_heads * attention_dim)
+        
+        # Value projection: Transform the latent Z before diffusion
+        self.value_proj = nn.Linear(latent_dim, latent_dim)
+        
+        # Output projection after concatenating heads
+        self.out_proj = nn.Linear(latent_dim, latent_dim)
+        
         self.alpha_logit = nn.Parameter(torch.tensor(0.0))
-        
-        # Projections for attention mechanism (Query/Key)
-        self.query_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d, attention_dim),
-                nn.LayerNorm(attention_dim)
-            ) for d in context_dims
-        ])
-        self.key_projs = nn.ModuleList([
-            nn.Sequential(
-                nn.Linear(d, attention_dim),
-                nn.LayerNorm(attention_dim)
-            ) for d in context_dims
-        ])
-        
-        # Pairwise restriction maps between all contexts
-        self.restrictions = nn.ModuleDict()
-        for i in range(n_contexts):
-            for j in range(n_contexts):
-                if i != j:
-                    self.restrictions[f"{i}_{j}"] = SoftOrthogonalRestriction(
-                        context_dims[i], context_dims[j]
-                    )
-
-    def compute_adjacency(self, sections: List[torch.Tensor]) -> torch.Tensor:
-        """
-        Computes the attention-based adjacency matrix between contexts.
-        """
-        batch_size = sections[0].shape[0]
-        device = sections[0].device
-        
-        # Spatial pooling if input is 3D (to handle sequence data)
-        pooled = []
-        for s in sections:
-            if s.dim() == 2:
-                pooled.append(s)
-            else:
-                p = s.flatten(start_dim=1, end_dim=-2).mean(dim=1)
-                pooled.append(p)
-
-        # Compute Attention Scores
-        Q = torch.stack([
-            self.query_projs[i](pooled[i]) 
-            for i in range(self.n_contexts)
-        ], dim=1)
-        
-        K = torch.stack([
-            self.key_projs[i](pooled[i]) 
-            for i in range(self.n_contexts)
-        ], dim=1)
-        
-        temperature = torch.exp(torch.tensor(np.log(self.attention_dim) / 2, device=device))
-        scores = torch.bmm(Q, K.transpose(1, 2)) / temperature
-        
-        # Mask self-loops (diagonal)
-        mask = torch.eye(self.n_contexts, device=device).bool().unsqueeze(0)
-        scores = scores.masked_fill(mask, -1e9)
-        adj = F.softmax(scores, dim=-1)
-        
-        return adj
 
     def forward(self, sections: List[torch.Tensor], diffusion_scale: float = 1.0) -> Tuple[List[torch.Tensor], torch.Tensor]:
+        device = sections[0].device
         batch_size = sections[0].shape[0]
-        adjacency = self.compute_adjacency(sections)
         
-        # Calculate final alpha (diffusion strength)
+        # Stack inputs: (Batch, N, Context_Dim)
+        x_stack = torch.stack(sections, dim=1) 
+        
+        # Projection into the Latent Space
+        # optimizing with Conv1D ?
+        z_list = [proj(sections[i]) for i, proj in enumerate(self.projectors)]
+        z_stack = torch.stack(z_list, dim=1)
+        
+        # Multi-Head Attention Preparation
+        Q = self.query_proj(x_stack).view(batch_size, self.n_contexts, self.n_heads, self.attention_dim)
+        K = self.key_proj(x_stack).view(batch_size, self.n_contexts, self.n_heads, self.attention_dim)
+        
+        # V: (Batch, N, Heads, Head_Dim) -> The latent Z serves as Value
+        # Transform Z to mix before diffusion
+        V = self.value_proj(z_stack).view(batch_size, self.n_contexts, self.n_heads, self.head_dim)
+        
+        # Feature map phi(x) = elu(x) + 1 for Linear Attention
+        Q_prime = F.elu(Q) + 1.0
+        K_prime = F.elu(K) + 1.0
+        
+        # Linear Multi-Head Diffusion
+        # Linear Attention formula: (Q @ (K.T @ V)) / (Q @ K.T @ 1)
+        
+        # Numerator: KV_sum = Sum_j (K_j * V_j) -> (Batch, Heads, Attn_Dim, Head_Dim)
+        KV_sum = torch.einsum('bnhd,bnhv->bhdv', K_prime, V) # einsum for my GPU :)
+        
+        # Z_num = Q_i * KV_sum -> (Batch, N, Heads, Head_Dim)
+        Z_num = torch.einsum('bnhd,bhdv->bnhv', Q_prime, KV_sum)
+        
+        # Denominator: K_sum = Sum_j (K_j) -> (Batch, Heads, Attn_Dim)
+        K_sum = K_prime.sum(dim=1) 
+        # Z_denom = Q_i * K_sum -> (Batch, N, Heads)
+        Z_denom = torch.einsum('bnhd,bhd->bnh', Q_prime, K_sum).unsqueeze(-1)
+        
+        # Result per head
+        z_diffused_heads = Z_num / (Z_denom + 1e-6)
+        
+        # Concatenation of heads (Flatten) -> (Batch, N, Total_Latent_Dim)
+        z_diffused = z_diffused_heads.reshape(batch_size, self.n_contexts, self.total_latent_dim)
+        z_diffused = self.out_proj(z_diffused) # Final mixing between heads
+
+        # Deprojection and Update
         alpha = torch.sigmoid(self.alpha_logit) * diffusion_scale
-        
         new_sections = []
         
-        # Sheaf Diffusion Process: X_i = (1-a)X_i + a * sum(A_ij * Rho_ji(X_j)) 
-        for i in range(self.n_contexts):
-            current_s = sections[i]
-            diffusion_term = torch.zeros_like(current_s)
+        # Apply specific deprojectors for each asset
+        for i, deproj in enumerate(self.deprojectors):
+            term_diffused = deproj(z_diffused[:, i, :])
+            # Residual update: X_new = (1-a)X + a*Diffused
+            new_sections.append((1 - alpha) * sections[i] + alpha * term_diffused)
             
-            for j in range(self.n_contexts):
-                if i == j:
-                    continue
-                
-                # Transport data from j to i using restriction map
-                transported = self.restrictions[f"{j}_{i}"](sections[j])
-                weight = adjacency[:, i, j].view(batch_size, *([1] * (current_s.dim() - 1)))
-                diffusion_term += weight * transported
-            
-            # Diffusion avec alpha adaptatif
-            new_sections.append((1 - alpha) * current_s + alpha * diffusion_term)
-        
-        return new_sections, adjacency
-
+        return new_sections, None # No explicit adjacency (compatibility)
 
 class ScaleTransition(nn.Module):
     """
@@ -243,6 +252,7 @@ class HierarchicalFSL(nn.Module):
                  scales: List[int] = [16, 8, 4],
                  context_dim: int = 32,
                  attention_dim: int = 64,
+                 latent_dim: int = 16,
                  diffusion_steps: List[int] = [2, 3, 4]):
         super().__init__()
         self.scales = scales
@@ -267,11 +277,12 @@ class HierarchicalFSL(nn.Module):
         
         # Diffusion layers for each scale
         self.sheaves = nn.ModuleList([
-            DynamicSheafLaplacian(
+            MultiHeadSheafLaplacian(
                 n_contexts=n,
-                context_dims=[context_dim] * n,
+                context_dim=context_dim,
+                latent_dim=latent_dim,
                 attention_dim=attention_dim,
-                alpha=0.5  # Initial, sera appris
+                n_heads=4
             )
             for n in scales
         ])
@@ -308,7 +319,7 @@ class HierarchicalFSL(nn.Module):
         stacked_inputs = torch.stack(inputs)
         avg_magnitude = torch.mean(torch.abs(stacked_inputs))
         
-        diffusion_scale = 1.0
+        diffusion_scale = 1.0 # This will change in the future !!
         if avg_magnitude > 0.9: 
             diffusion_scale = 0.1 # Reduce diffusion by 90%
         
@@ -369,57 +380,119 @@ class HierarchicalFSL(nn.Module):
     def compute_h1_multiscale(self, pyramid: List[List[torch.Tensor]], 
                              adjacency_pyramid: List[torch.Tensor]) -> torch.Tensor:
         """
-        Computes the H1 Cohomology across scales.
-        Lower H1 = More global consistency/coherence.
-        Higher weights are assigned to coarser scales (global structures).
+        Compute cohomology H1 across scales.
         """
         total_h1 = 0.0
-        scale_weights = [1.0, 1.5, 2.0] #NOTE: this is bad
+        # Stronger weights for coarser scales (global structures)
+        scale_weights = [1.0, 1.5, 2.0] 
         
-        for scale_idx, (sections, adj) in enumerate(zip(pyramid[1:], adjacency_pyramid)):
+        # Iterate over pyramid levels (except level 0 which is the raw input)
+        for scale_idx, sections in enumerate(pyramid[1:]):
+            # Retrieve the Sheaf corresponding to this scale
+            # Note: sheaves[0] is for the fine scale, sheaves[1] for the next, etc.
             sheaf = self.sheaves[scale_idx + 1]
-            n_contexts = len(sections)
             
+            n_contexts = len(sections)
             scale_h1 = 0.0
             count = 0
             
+            # --- Stochastic sampling strategy ---
+            # Instead of doing N^2 pairs, we take K random pairs per node.
+            # This keeps the complexity linear O(N * K).
+            n_samples = 5 
+            
+            # If we have an adjacency (non-factorized case), we use it to guide.
+            # Otherwise (factorized case), we sample uniformly or via cosine similarity.
+            adj = adjacency_pyramid[scale_idx] if scale_idx < len(adjacency_pyramid) else None
+            
             for i in range(n_contexts):
-                for j in range(n_contexts):
-                    if i == j:
-                        continue
+                # Select neighbors 'j' to compare
+                if adj is not None:
+                    # We take the strongest neighbors based on adjacency
+                    weights = adj[:, i, :].mean(dim=0) # Average over the batch
+                    indices = torch.topk(weights, k=min(n_samples, n_contexts), largest=True).indices
+                else:
+                    # Random sampling (Monte Carlo H1)
+                    indices = torch.randint(0, n_contexts, (n_samples,), device=sections[0].device)
+                
+                for j in indices:
+                    if i == j: continue
                     
-                    # Calculate consistency: Rho_ji(Rho_ij(x)) vs x
-                    rho_ij = sheaf.restrictions[f"{i}_{j}"]
-                    rho_ji = sheaf.restrictions[f"{j}_{i}"]
+                    # Factorized Case (O(N)): Generate Rho on the fly
+                    # Rho_ij = Deproj_j @ Proj_i
+                    # Rho_ji = Deproj_i @ Proj_j
                     
-                    cycle = rho_ji(rho_ij(sections[i]))
-                    weight = adj[:, i, j].mean()
+                    #ANCHOR: For efficiency, we apply Proj then Deproj directly on tensors
+                    # without constructing the dense W matrix. This will maybe change in the future
+                                            
+                    # Cycle: x_i -> Proj_i -> z -> Deproj_j (x_j_hat) -> Proj_j -> z' -> Deproj_i (cycle)
                     
-                    # Only consider strong connections
+                    # x_i projected into the latent space of i
+                    z_i = sheaf.projectors[i](sections[i]) 
+                    
+                    # Transport to j (in the latent space, we assume trivial transport or implicit adjacency)
+                    # For standard H1: we compare Rho_ji( Rho_ij(x_i) ) to x_i
+                    
+                    # Step 1: Rho_ij(x_i) : Transport from i to j
+                    # In the factorized model: x_i -> z -> x_j (via deproj_j)
+                    x_j_simulated = sheaf.deprojectors[j](z_i)
+                    
+                    # Step 2: Rho_ji(...) : Return from j to i
+                    z_j = sheaf.projectors[j](x_j_simulated)
+                    cycle = sheaf.deprojectors[i](z_j)
+                    
+                    # Implicit weight (assumed 1.0 or based on latent similarity)
+                    weight = 1.0
+
+                    # 2. Calculation of the consistency error (H1)
                     if weight > 0.05:
                         diff = (cycle - sections[i]).pow(2).mean()
                         scale_h1 += weight * diff
                         count += 1
             
             if count > 0:
-                scale_weight = scale_weights[min(scale_idx, len(scale_weights)-1)]
-                total_h1 += scale_weight * (scale_h1 / count)
+                w = scale_weights[min(scale_idx, len(scale_weights)-1)]
+                total_h1 += w * (scale_h1 / count)
         
-        return total_h1 / sum(scale_weights[:len(adjacency_pyramid)])
+        return total_h1
     
     def compute_ortho_loss(self) -> torch.Tensor:
-        """
-        Aggregates orthogonality loss from all restriction maps.
-        """
         loss = 0.0
         count = 0
         
         for sheaf in self.sheaves:
-            for restriction in sheaf.restrictions.values():
-                loss += restriction.orthogonality_loss()
-                count += 1
-        
-        return loss / count
+            # Iterate over all submodules to find Linear layers
+            # Projectors
+            for proj in sheaf.projectors:
+                for m in proj.modules():
+                    if isinstance(m, nn.Linear):
+                        w = m.weight
+                        # Tall matrix
+                        if w.shape[0] > w.shape[1]:
+                            gram = w.t() @ w
+                            eye = torch.eye(w.shape[1], device=w.device)
+                        # Wide matrix
+                        else: 
+                            gram = w @ w.t()
+                            eye = torch.eye(w.shape[0], device=w.device)
+                        loss += F.mse_loss(gram, eye)
+                        count += 1
+            
+            # Deprojectors
+            for deproj in sheaf.deprojectors:
+                for m in deproj.modules():
+                    if isinstance(m, nn.Linear):
+                        w = m.weight
+                        if w.shape[0] > w.shape[1]:
+                            gram = w.t() @ w
+                            eye = torch.eye(w.shape[1], device=w.device)
+                        else:
+                            gram = w @ w.t()
+                            eye = torch.eye(w.shape[0], device=w.device)
+                        loss += F.mse_loss(gram, eye)
+                        count += 1
+                        
+        return loss / (count + 1e-8)
 
 class TopologicalContrastiveLoss(nn.Module):
     """
@@ -430,7 +503,7 @@ class TopologicalContrastiveLoss(nn.Module):
         self.margin = margin
     
     def forward(self, h1_coherent: torch.Tensor, h1_incoherent: torch.Tensor) -> torch.Tensor:
-       # Coherent data should have low H1, Incoherent data should have high H1
+        # Coherent data should have low H1, Incoherent data should have high H1
         loss_coherent = h1_coherent
         loss_incoherent = F.relu(self.margin - h1_incoherent)
         
@@ -456,9 +529,9 @@ class TopologicalTripletLoss(nn.Module):
                 anchor_embedding: torch.Tensor = None,
                 positive_embedding: torch.Tensor = None) -> torch.Tensor:
         """
-        h1_anchor : Score H1 de la fenêtre actuelle (doit être bas)
-        h1_positive : Score H1 d'une fenêtre proche ou augmentée (doit être bas et proche de anchor)
-        h1_negative : Score H1 d'une fenêtre bruitée/shufflée (doit être haut)
+        h1_anchor : Score H1 of actual window (should be low)
+        h1_positive : Score H1 of a nearby or augmented window (should be low and close to anchor)
+        h1_negative : Score H1 of a noisy/shuffled window (should be high)
         """
         
         # Structural Term: Minimize H1 for valid data (Anchor & Positive)

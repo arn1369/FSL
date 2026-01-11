@@ -1,6 +1,13 @@
+
+"""
+FSL Implementation
+@author : Arnaud Ullens
+@created :  8th dec.2025
+last modification : 11th jan.2025
+"""
+
 import torch
 import numpy as np
-import pandas as pd
 import random
 import pickle
 from torch.utils.data import DataLoader
@@ -19,25 +26,25 @@ def set_seed(seed=1):
 
 def get_market_data(start_date="2019-01-01", end_date="2025-01-01"):
     tickers = [
-        "AAPL", "NVDA", "AMD", "INTC", "MSFT", "ADBE", "CRM", "ORCL",
-        "JPM", "BAC", "WFC", "C", "XOM", "CVX", "COP", "SLB"
+        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", 
+        "JPM", "BAC", 
+        "XOM", "CVX",
+        "JNJ", "PFE",
+        "PG", "KO", "MCD", "HD",
+        "DIS"
     ]
     data = yf.download(tickers, start=start_date, end=end_date, auto_adjust=False)['Close']
-    # MultiIndex handling
-    if isinstance(data.columns, pd.MultiIndex):
-        if 'Close' in data.columns.get_level_values(0):
-            data = data['Close']
-        else:
-            try:
-                data = data.xs('Close', axis=1, level=1)
-            except:
-                pass
-                
-    data = data[tickers]
+    
+    valid_tickers = [t for t in tickers if t in data.columns]
+    
+    if len(valid_tickers) < len(tickers):
+        print(f"Warning: {len(tickers) - len(valid_tickers)} tickers failed to download.")
+    
+    data = data[valid_tickers]
     data = data.ffill()
     returns = np.log(data / data.shift(1))
     returns = returns.dropna(how='all').fillna(0.0)
-    return returns, tickers
+    return returns, valid_tickers
 
 def compute_metrics(pnl_series, returns_series, exposure_history):
     pnl_arr = np.array(pnl_series)
@@ -76,10 +83,10 @@ def compute_metrics(pnl_series, returns_series, exposure_history):
 def run_backtest():
     set_seed(1)
     
-    # 1. Load Data
+    # Load Data
     df_returns, ticker_names = get_market_data(start_date="2019-01-01", end_date="2025-11-30")
     
-    test_start = "2021-06-01"
+    test_start = "2021-06-01" # warm-up
     test_end = "2025-06-01"
     
     # Pre-calculate Market Trend & Volatility
@@ -99,23 +106,40 @@ def run_backtest():
     
     WINDOW_SIZE = 20
     test_ds = RollingWindowDataset(test_df, window_size=WINDOW_SIZE)
-    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
-    
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)    
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     
-    # 2. Load model
+    # Load model
     model = FSLPredictor(n_assets=16, window_size=WINDOW_SIZE)
     model.to(device)
     try:
         model.load_state_dict(torch.load("./saves/final_fsl.pth", map_location=device))
-    except:
-        print("Error: Could not load model. Falling back to random init (Results will be meaningless).")
+    except Exception as e:
+        raise Exception(f"Error loading model : {e}")
     model.eval()
         
     # Initialization HMM & Z-Score
     hmm = MultiRegimeHMM(inertia=0.90)
-    hmm.means = np.array([3.0, 1.5, 0.0, -1.0]) #NOTE: BAD. Needs to be changed (random here but can overfit)
+    hmm.means = np.array([3.0, 1.5, 0.0, -1.0]) #NOTE: BAD. Needs to be changed
     hmm.vars = np.array([1.0, 0.8, 0.5, 0.5])
+    
+    # Calibrating HMM on first 100 days
+    
+    calibration_h1 = []
+    # Small pass to calibrate
+    limit = min(100, len(test_loader))
+    for i, (inputs, _) in enumerate(test_loader):
+        if i >= limit: break
+        inputs = [x.to(device).float() for x in inputs]
+        _, res = model(inputs)
+        calibration_h1.append(res['h1_score'].item())
+    
+    mean_h1 = np.mean(calibration_h1)
+    std_h1 = np.std(calibration_h1)
+    print(f"H1 Stats: Mean={mean_h1:.4f}, Std={std_h1:.4f}")
+    
+    # Reset loader for the actual test
+    test_loader = DataLoader(test_ds, batch_size=1, shuffle=False)
     
     z_scorer = RollingZScore(window=60)
     
@@ -189,24 +213,31 @@ def run_backtest():
             elif dominant_regime == 2: # NORMAL
                 # Only go aggressive if alpha is strong AND prediction is positive
                 if alpha_strength > current_convic_th and pred_mean > 0:
+                    # CONVICTION MODE 
+                    # invest on best ones
                     weights = np.exp(pred_val * 2.0) / np.sum(np.exp(pred_val * 2.0))
                     current_exposure = 1.0 
                     regime_label += " (Conviction)"
                 else:
-                    # Defensive Long/Short
-                    long_mask = z_scores_cross > 0.5
-                    short_mask = z_scores_cross < -0.5
-                    if np.sum(long_mask) > 0: weights[long_mask] = 0.5 / np.sum(long_mask)
-                    if np.sum(short_mask) > 0: weights[short_mask] = -0.5 / np.sum(short_mask)
+                    long_mask = z_scores_cross > 0.5 # best assets
+                    
+                    short_mask = z_scores_cross < -0.5 # bad  assets
+                    
+                    if np.sum(long_mask) > 0: 
+                        weights[long_mask] = 0.5 / np.sum(long_mask) # 50% on long
+                    
+                    # 50% in cash if no shorts (will be improved later with options)
+                    
                     current_exposure = 1.0
-                    regime_label += " (Neutral)"
+                    regime_label += " (Neutral Long)"
 
             elif dominant_regime == 1: # VOLATIL
-                # Market is choppy/down: Minimize exposure, go Long/Short or Cash
-                current_exposure = 0.5
+                # cash (again, will be improved later with options)
+                weights = np.zeros(16)
+                current_exposure = 0.0
             
             else: # CRISIS
-                current_exposure = 0.0 # Cash is King
+                current_exposure = 0.0 # Cash (for now, to be improved)
             
             # Execution
             daily_ret = np.sum(weights * targets_np) * current_exposure
@@ -230,6 +261,16 @@ def run_backtest():
     for regime, count in regime_counts.most_common():
         pct = count / len(regime_history) * 100
         print(f"  • {regime:20s}  : {pct:5.1f}%")
+    
+    flat_pnl = np.array(pnl_strategy)
+    flat_market = np.array(pnl_market)
+    
+    # Correlation when the model is exposed (>0.1)
+    mask = np.array(exposure_history) > 0.1
+    if np.sum(mask) > 10:
+        active_correlation = np.corrcoef(flat_pnl[mask], flat_market[mask])[0, 1]
+        print(f"\nDIAGNOSTIC:")
+        print(f"  Correlation with Market when Active: {active_correlation:.2f}")
         
     results_data = {
         "dates": test_df.index[WINDOW_SIZE:],
