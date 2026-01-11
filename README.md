@@ -125,6 +125,41 @@ So we can see that it's more of a Smart Beta method. We have a nice drawdown, pa
 
 ![perf.png](./visuals/perf.png "Performances")
 
+## Launch the code
+
+0) If you don't know git, first install it
+
+    ```bash
+        sudo apt install git # ubuntu/debian
+        # Check on internet for windows, you probably know better than me
+    ```
+
+1) Of course, clone the repo & go to directory
+
+    ```bash
+        git clone git@github.com:arn1369/FSL.git # ssh
+        git clone https://github.com/arn1369/FSL.git # https
+        cd FSL
+    ```
+
+2) train model (optional)  - already trained model in /saves
+
+    ```bash
+    python3 src/train.py
+    ```
+
+3) test model
+
+    ```bash
+    python3 src/test.py
+    ```
+
+4) making plots
+
+    ```bash
+    python3 src/visuals.py
+    ```
+
 ## Bibliography and notes
 
 A lot of work comes from the paper [Sheaf Cohomology of Linear Predictive Coding Networks](https://arxiv.org/pdf/2511.11092) from Jeffrey Seely at Sakana AI  (14 nov. 2025). My work is the implementation and some improvements of its work.
