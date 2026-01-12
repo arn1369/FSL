@@ -73,17 +73,18 @@ The goal is to apply FSL in more domains, notably in medical predictions data.
 ### Problems and possible solutions
 
 1) Major problem : survivor bias. BUT ! With the new complexity, I can try it on more tickers, probably all the S&P500 ! (need to test it)
-2) Hard-Coded Gating -> use soft gating or continuous transfer function?
-3) Adaptive Parameters using percentiles instead of values
-4) Non-stationarity of $H¹$ : Fix means in HMM to define regimes. Need to update that slowly (So that if the market structurally change, the model learns it). For now, we define Crisis based on high quantiles of the H1 distribution.
-5) No fees of trading.
-6) Survivor bias (we have the S&P500 (16 tickers) on assets that performed really well these last years)
-7) [SOLVED] Hard scalability on large number of assets (N² restriction matrices). Complexity of $O(N²)$. Here we have 256 matrices (16²). S&P500 : ~250,000 !! We use Multi-head now.
-8) Perpetual fight against trivial collapse, with spectral regularization. For now I don't have this problem, but maybe need to optimize it.
-9) Bad in fast crash (lag of HMM)
-10) With M&A, bad ! -> MSFT acquires Activision. Activision will be uncorrelated from the market to align with MSFT. $H¹$ is high and detect risk and shout the crisis.
-11) [SOLVED] Complexity ($O(N²*D²)$ with N number of asset pairs and D feature dimension). Really bad for scaling... Transformer : $O(N²\cdot D)$. A possible solution (need to confirm it with results) would be to restraint assets to "talk" with only it's k neighbors : $O(N\cdot k\cdot D²)$, more viable.
-12) Better README file (finalize using latex for formulas etc) and better in-detail explanations
+2) **Major problem** : the expected variance of the day was normalized with the actual variance (look-ahead bias !). Without this, the model is "following" the market, without a significative improvement vs baseline. I'm actively working on the 2nd version, notably the proof that $H^1$ is useful in markets (correlation $H^1$ with volatility, regime differentiation?). For now, I just need a nice training (tried adversarial to avoid model collapse, doesn't work, now trying to use supervised (the model tries to minimize $H^1$ everytime, so he doesn't learn properly crisis states).
+3) Hard-Coded Gating -> use soft gating or continuous transfer function?
+4) Adaptive Parameters using percentiles instead of values
+5) Non-stationarity of $H¹$ : Fix means in HMM to define regimes. Need to update that slowly (So that if the market structurally change, the model learns it). For now, we define Crisis based on high quantiles of the H1 distribution.
+6) No fees of trading.
+7) Survivor bias (we have the S&P500 (16 tickers) on assets that performed really well these last years)
+8) [SOLVED] Hard scalability on large number of assets (N² restriction matrices). Complexity of $O(N²)$. Here we have 256 matrices (16²). S&P500 : ~250,000 !! We use Multi-head now.
+9) Perpetual fight against trivial collapse, with spectral regularization. For now I don't have this problem, but maybe need to optimize it.
+10) Bad in fast crash (lag of HMM)
+11) With M&A, bad ! -> MSFT acquires Activision. Activision will be uncorrelated from the market to align with MSFT. $H¹$ is high and detect risk and shout the crisis.
+12) [SOLVED] Complexity ($O(N²*D²)$ with N number of asset pairs and D feature dimension). Really bad for scaling... Transformer : $O(N²\cdot D)$. A possible solution (need to confirm it with results) would be to restraint assets to "talk" with only it's k neighbors : $O(N\cdot k\cdot D²)$, more viable.
+13) Better README file (finalize using latex for formulas etc) and better in-detail explanations
 
 ### Improvements
 
@@ -98,32 +99,6 @@ The goal is to apply FSL in more domains, notably in medical predictions data.
 9) RL for leverage (for now, if("BULL"): leverage=1.5) to learn what is the best one. See paper on RL in finance (PPO agent);
 10) Vectorize cycles computing (better use on GPU)
 11) Scheduler on train (I have 10 epochs now but in the future).
-
-## Results
-
-In this version, we get these results :
-
-Tickers :
-        "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "JPM", "BAC", "XOM", "CVX", "JNJ", "PFE", "PG", "KO", "MCD", "HD", "DIS"
-Train on 2010-01-01 to 2018-12-31
-Test on 2019-01-01 to 2025-01-01
-
-PERFORMANCE:
-  FSL+HMM Strategy: Sharpe=1.93, Return=87.66%
-  Max Drawdown: -5.51%
-
-REGIME DISTRIBUTION:
-  • Normal (Conviction)   :  59.1%
-  • Volatil               :  30.4%
-  • Bull                  :   9.9%
-  • Normal (Neutral Long)  :   0.6%
-
-DIAGNOSTIC:
-  Correlation with Market when Active: 0.94
-
-So we can see that it's more of a Smart Beta method. We have a nice drawdown, particularly in 2022 (-5.51% with FSL instead of -33% with market), but the thing is that the model just cash out. Nice sharp ratio, but 86% on 4 years, it's less than Buy&Hold. Maybe need to tune that, and ~10% in Bull is maybe a bit bad. This will (I hope) change in the next version (with better HMM approach)
-
-![perf.png](./visuals/perf.png "Performances")
 
 ## Launch the code
 
