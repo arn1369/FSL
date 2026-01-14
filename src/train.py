@@ -1,31 +1,24 @@
-
-"""
-FSL Implementation
-@author : Arnaud Ullens
-@created :  8th dec.2025
-last modification : 11th jan.2025
-"""
-
 import yfinance as yf
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import numpy as np
+import pandas as pd
 import os
 from torch.utils.data import Dataset, DataLoader
 
 from fsl import HierarchicalFSL, TopologicalTripletLoss
+from utils import FSLPredictor, UniversalDataset
 
 def get_universal_data():
     """
     Downloads and cleans S&P 500 data.
     Returns RAW RETURNS.
+    Global normalization is avoided here to prevent Look-Ahead Bias.
     """
     
-    print("Downloading Universal Dataset...")
+    print("Downloading data...")
     
-    # Selection of diverse sectors (Tech, Finance, Energy, Health, etc.)
-    # to ensure the model learns universal market dynamics.
     tickers = [
         "AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", 
         "JPM", "BAC", 
@@ -35,87 +28,32 @@ def get_universal_data():
         "DIS"
     ]
     
-    data = yf.download(tickers, start="2010-01-01", end="2018-12-31", progress=True, auto_adjust=True)['Close']
-
-    valid_tickers = [t for t in tickers if t in data.columns]
+    data = yf.download(tickers, start="2010-01-01", end="2018-12-31", progress=True, auto_adjust=True)
     
-    if len(valid_tickers) < len(tickers):
-        print(f"Warning: {len(tickers) - len(valid_tickers)} tickers failed to download.")
-    
-    data = data[valid_tickers]
+    if isinstance(data.columns, pd.MultiIndex):
+        try:
+            if 'Close' in data.columns.get_level_values(0):
+                df = data['Close']
+            else:
+                df = data.xs('Close', axis=1, level=0)
+        except:
+            print("This isn't supposed to happen.")
+            df = data['Adj Close']
+    else:
+        df = data['Close'] if 'Close' in data.columns else data
 
     # Cleaning Data
-    data = data.dropna(axis=1, thresh=int(len(data)*0.9)) # keep tickers with at least 90% data
-    data = data.ffill().bfill()
+    df = df.dropna(axis=1, thresh=int(len(df)*0.9)) # keep tickers with at least 90% data
+    df = df.ffill().bfill()
     
-    returns = data.pct_change().dropna()
+    returns = df.pct_change().dropna()
     
     print(f"Valid tickers retrieved: {len(returns.columns)}")
     print(f"Data ready. Shape: {returns.shape}")
     
     return returns, returns.columns.tolist()
 
-class UniversalDataset(Dataset):
-    def __init__(self, dataframe, window_size=20, augment=False):
-        self.data = dataframe
-        self.window_size = window_size
-        self.augment = augment
-        self.n_assets = dataframe.shape[1]
-        self.values = dataframe.values.astype(np.float32)
 
-    def __len__(self):
-        return len(self.data) - self.window_size
-
-    def __getitem__(self, idx):
-        raw_window = self.values[idx : idx + self.window_size]
-        target = self.values[idx + self.window_size]
-        
-        # Harmonization with utils.py to avoid Distribution Shift
-        normalized_window = raw_window * 100.0 
-        
-        # Clip for numerical stability
-        normalized_window = np.clip(normalized_window, -5.0, 5.0)
-
-        if self.augment:
-            # Reduced noise since the scale is x100
-            noise = np.random.normal(0, 0.05, normalized_window.shape)
-            normalized_window = normalized_window + noise
-
-        inputs = [torch.tensor(normalized_window[:, i]) for i in range(self.n_assets)]
-        target_tensor = torch.tensor(target, dtype=torch.float)
-
-        return inputs, target_tensor
-    
-class FSLPredictor(nn.Module):
-    """
-    Wraps the Hierarchical FSL backbone with a prediction head.
-    The FSL extracts features, and the head predicts the next return.
-    """
-    def __init__(self, n_assets, window_size):
-        super().__init__()
-        self.fsl = HierarchicalFSL(
-            scales=[16, 4, 1], # Hierarchical reduction
-            context_dim=window_size,
-            attention_dim=32,
-            diffusion_steps=[1, 2, 2]
-        )
-        # Simple linear head for forecasting
-        self.head = nn.Sequential(
-            nn.Linear(window_size, 32),
-            nn.GELU(),
-            nn.Linear(32, 1)
-        )
-        
-    def forward(self, x_list):
-        res = self.fsl(x_list)
-        clean_sections = res['sections']
-        
-        # Predict separately for each asset using the shared head
-        preds = []
-        for section in clean_sections:
-            preds.append(self.head(section))
-            
-        return torch.cat(preds, dim=1), res
 
 def correlation_loss(pred, target):
     """
@@ -140,169 +78,117 @@ def sign_loss(pred, target):
     return 1 - torch.mean(pred_sign * target_sign)
 
 def train_model():
-    # Load data
+    # 1. Loading data
     try:
-        df_univ, tickers = get_universal_data()
+        df_univ, tickers = get_universal_data() 
     except Exception as e:
-        print(f"Critical error during download: {e}")
+        print(f"Error while loading data : {e}")
         return
     
-    # Time-based split (Train: first 80%, Val: next 10%)
+    # Saves directory
+    if not os.path.exists("./saves"):
+        os.makedirs("./saves")
+    
+    # 2. Strict temporal split
+    # Define boundaries before any statistical calculation
     train_split = int(len(df_univ) * 0.8)
     val_split = int(len(df_univ) * 0.9)
     
     train_df = df_univ.iloc[:train_split]
     val_df = df_univ.iloc[train_split:val_split]
     
-    print(f"Train: {len(train_df)} days, Val: {len(val_df)} days")
+    print(f"Train: {len(train_df)} days | Val: {len(val_df)} days")
+
+    # 3. CALCULATING THE PRIOR (Only on the Train set)
+    # We calculate the historical correlation only on the training period.
+    corr_matrix = train_df.corr().values
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    prior_tensor = torch.tensor(corr_matrix, dtype=torch.float32).to(device)
     
-    # Initialize Datasets (augment only on training)
+    # 4. Initializing Datasets and Loaders
     train_ds = UniversalDataset(train_df, augment=True)
     val_ds = UniversalDataset(val_df, augment=False)
     
-    if len(train_ds) == 0:
-        print("Error : Empty dataset.")
-        return
-
     train_loader = DataLoader(train_ds, batch_size=32, shuffle=True)
     val_loader = DataLoader(val_ds, batch_size=32, shuffle=False)
     
-    # Setup Device and Model
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print(f"Training on {device}.")
+    # 5. Instantiation of the Model with the Prior
+    model = FSLPredictor(n_assets=len(tickers), window_size=20, prior=prior_tensor).to(device)
     
-    os.makedirs("./saves", exist_ok=True)
-    
-    model = FSLPredictor(n_assets=16, window_size=20).to(device)
     optimizer = optim.AdamW(model.parameters(), lr=5e-4, weight_decay=1e-5)
-    
-    # Initialize Losses
-    triplet_criterion = TopologicalTripletLoss(margin=0.5, structural_weight=0.5).to(device)
+    triplet_criterion = TopologicalTripletLoss(margin=0.5).to(device)
     mse_criterion = nn.MSELoss()
     
-    # Early Stopping parameters
+    # 6. Training Loop
     epochs = 20
-    patience = 4
     best_val_loss = float('inf')
-    patience_counter = 0
-    
-    model.train()
     
     for epoch in range(epochs):
-        # TRAINING
+        model.train()
         total_loss = 0
-        batch_count = 0
         
         for inputs, targets in train_loader:
             inputs = [x.to(device).float() for x in inputs]
             targets = targets.to(device).float()
             
-            # Anchor Pass (Clean Data)
             optimizer.zero_grad()
+            
+            # --- ANCHOR PASS (Real data) ---
             preds_anchor, res_anchor = model(inputs)
             
-            # Positive Pass (Slightly Noisy Data)
-            # We want the topology (H1 score) to remain stable despite noise
+            # --- POSITIVE PASS (Light noise) ---
             inputs_pos = [x + torch.randn_like(x) * 0.005 for x in inputs]
             _, res_pos = model(inputs_pos)
             
-            # Negative Pass (Incoherent/Shuffled Data)
-            # We want the topology to look very different (high H1) for shuffled data
-            batch_size = inputs[0].size(0)
-            inputs_neg = []
-            for x in inputs:
-                perm = torch.randperm(batch_size)
-                inputs_neg.append(x[perm])
-            
+            # --- NEGATIVE PASS (Shuffle assets to break topology) ---
+            # We permute assets within the batch
+            n_assets = len(inputs)
+            asset_perm = torch.randperm(n_assets)
+            inputs_neg = [inputs[p].clone() for p in asset_perm]
+            # We add some noise to mask residual similarities
+            inputs_neg = [x + torch.randn_like(x) * 0.05 for x in inputs_neg]
             _, res_neg = model(inputs_neg)
-                        
-            #ANCHOR: LOSS COMPUTING
             
-            # Prediction Accuracy (MSE)
-            mse = mse_criterion(preds_anchor, targets)
+            # --- CALCULATION OF LOSSES ---
+            # 1. MSE Prediction
+            loss_mse = mse_criterion(preds_anchor, targets)
             
-            
-            # Topological Triplet Loss
-            # Objectives: Low H1 for Anchor/Pos, High H1 for Neg, Anchor ≈ Pos
-            triplet_loss = triplet_criterion(
-                h1_anchor=res_anchor['h1_score'],
-                h1_positive=res_pos['h1_score'],
-                h1_negative=res_neg['h1_score']
+            # 2. Topological Triplet Loss (H1)
+            loss_triplet = triplet_criterion(
+                res_anchor['h1_score'], 
+                res_pos['h1_score'], 
+                res_neg['h1_score']
             )
             
-            # Orthogonality & Reconstruction (Regularization)
-            recon_loss = 0
-            for original, reconstructed in zip(inputs, res_anchor['outputs']):
-                recon_loss += torch.mean((original - reconstructed) ** 2)
-
-            # Financial Metrics (Correlation & Sign)
-            corr = correlation_loss(preds_anchor, targets)
-            s_loss = sign_loss(preds_anchor, targets)
+            # 3. Orthogonality Loss (Beam Regularization)
+            loss_ortho = res_anchor['ortho_loss']
             
-            # Total Loss combination
-            loss = 1.0 * corr + 0.5 * s_loss + 0.1 * mse + 0.5 * triplet_loss + 0.1 * recon_loss
-                    
+            # Total (Weighting)
+            loss = loss_mse + 0.5 * loss_triplet + 0.1 * loss_ortho
+            
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             
             total_loss += loss.item()
-            batch_count += 1
-        
-        avg_train_loss = total_loss / batch_count
-        
-        
-        # VALIDATION
-        model.eval()
-        val_loss = 0
-        val_count = 0
-        
-        with torch.no_grad():
-            for inputs, targets in val_loader:
-                inputs = [x.to(device).float() for x in inputs]
-                targets = targets.to(device).float()
-                
-                preds, res = model(inputs)
-                
-                # Validation metric: simplified loss
-                mse = mse_criterion(preds, targets)
-                recon_loss = 0
-                for original, reconstructed in zip(inputs, res['outputs']):
-                    recon_loss += torch.mean((original - reconstructed) ** 2)
-                
-                loss = mse + 0.5 * recon_loss
-                val_loss += loss.item()
-                val_count += 1
-        
-        avg_val_loss = val_loss / val_count
-        
-        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {avg_train_loss:.6f} | Val Loss: {avg_val_loss:.6f}")
-        
-        #ANCHOR: Early stopping check
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            patience_counter = 0
-            torch.save(model.state_dict(), "./saves/fsl.pth")
-            print(f"New best model saved (val_loss: {best_val_loss:.6f})")
-        else:
-            patience_counter += 1
-            if patience_counter >= patience:
-                print(f"\nEarly stopping triggered at epoch {epoch+1}")
-                break
-        
-        model.train()
-        
-    # Final save
-    print("\nLoading best model for final save...")
-    try:
-        model.load_state_dict(torch.load("./saves/fsl.pth"))
-    except FileNotFoundError:
-        print("Warning: Best model not found, saving current state.")
-    
-    torch.save(model.state_dict(), "./saves/final_fsl.pth")
-    print("Done.")
 
-if __name__ == "__main__":
-    torch.manual_seed(1) # reproducibility
-    np.random.seed(1)
-    train_model()
+        # 7. VALIDATION (Independent of the training prior)
+        model.eval()
+        val_mse = 0
+        with torch.no_grad():
+            for v_inputs, v_targets in val_loader:
+                v_inputs = [x.to(device).float() for x in v_inputs]
+                v_targets = v_targets.to(device).float()
+                v_preds, _ = model(v_inputs)
+                val_mse += mse_criterion(v_preds, v_targets).item()
+        
+        avg_val = val_mse / len(val_loader)
+        print(f"Epoch {epoch+1}/{epochs} | Train Loss: {total_loss/len(train_loader):.6f} | Val MSE: {avg_val:.6f}")
+        
+        if avg_val < best_val_loss:
+            best_val_loss = avg_val
+            torch.save(model.state_dict(), "./saves/fsl.pth")
+
+    print("Training completed.")
+    
+train_model()

@@ -1,11 +1,3 @@
-
-"""
-FSL Implementation
-@author : Arnaud Ullens
-@created :  8th dec.2025
-last modification : 11th jan.2025
-"""
-
 import numpy as np
 import torch
 from torch import nn
@@ -30,11 +22,11 @@ class MultiRegimeHMM:
         self.state_prob = np.array([0.05, 0.15, 0.60, 0.20])
         self.smooth_prob = np.array([0.05, 0.15, 0.60, 0.20])
         
-        # Z-score
+        # Z-scores
         self.means = np.array([3.0, 1.5, 0.0, -0.5]) 
         self.vars = np.array([1.0, 0.8, 0.5, 0.5])
         
-        # EMA to smooth the observation
+        # EMA to smooth observations
         self.ema_signal = None
         self.ema_alpha = 0.2
 
@@ -85,20 +77,16 @@ class RollingWindowDataset(Dataset):
     def __init__(self, dataframe, window_size=20):
         self.data = dataframe.values.astype(np.float32)
         self.window_size = window_size
-        
-        self.scale_factor = 100.0 
-
     def __len__(self):
         return len(self.data) - self.window_size
-
     def __getitem__(self, idx):
         window = self.data[idx : idx + self.window_size]
         target = self.data[idx + self.window_size]
-        
-        # Fix scaling
-        x_norm = window * self.scale_factor
-        
-        inputs = [torch.tensor(x_norm[:, i]) for i in range(x_norm.shape[1])]
+        mean = window.mean(axis=0, keepdims=True)
+        std = window.std(axis=0, keepdims=True) + 1e-6
+        x_norm = (window - mean) / std
+        x_norm_T = x_norm.T 
+        inputs = [torch.tensor(x_norm_T[i]) for i in range(x_norm_T.shape[0])]
         return inputs, torch.tensor(target)
 
 class FSLPredictor(nn.Module):
@@ -106,13 +94,14 @@ class FSLPredictor(nn.Module):
     Wraps the Hierarchical FSL backbone with a prediction head.
     The FSL extracts features, and the head predicts the next return.
     """
-    def __init__(self, n_assets, window_size):
+    def __init__(self, n_assets, window_size, prior=None):
         super().__init__()
         self.fsl = HierarchicalFSL(
             scales=[16, 4, 1], # Hierarchical reduction
             context_dim=window_size,
             attention_dim=32,
-            diffusion_steps=[1, 2, 2]
+            diffusion_steps=[3, 5, 5],
+            prior=prior
         )
         # Simple linear head for forecasting
         self.head = nn.Sequential(
@@ -131,3 +120,45 @@ class FSLPredictor(nn.Module):
             preds.append(self.head(section))
             
         return torch.cat(preds, dim=1), res
+    
+class UniversalDataset(Dataset):
+    def __init__(self, dataframe, window_size=20, augment=False):
+        """
+        dataframe : DataFrame of RAW returns.
+        """
+        self.data = dataframe
+        self.window_size = window_size
+        self.augment = augment
+        self.n_assets = dataframe.shape[1]
+        self.values = dataframe.values 
+
+    def __len__(self):
+        return len(self.data) - self.window_size
+
+    def __getitem__(self, idx):
+        # Extraction : Get the window and the next value (target)
+        raw_window = self.values[idx : idx + self.window_size]
+        target = self.values[idx + self.window_size]
+        
+        # Instance Normalization: Normalize each window independently (Mean=0, Std=1)
+        window_mean = np.mean(raw_window, axis=0)
+        window_std = np.std(raw_window, axis=0) + 1e-8
+        normalized_window = (raw_window - window_mean) / window_std
+        
+        # Augmentation: Add noise during training
+        if self.augment:
+            noise = np.random.normal(0, 0.05, normalized_window.shape)
+            normalized_window = normalized_window + noise
+
+        # Tensorization
+        inputs = []
+        for asset_idx in range(self.n_assets):
+            asset_series = normalized_window[:, asset_idx]
+            
+            tensor = torch.tensor(asset_series, dtype=torch.float) 
+            
+            inputs.append(tensor)
+            
+        target_tensor = torch.tensor(target, dtype=torch.float)
+
+        return inputs, target_tensor
