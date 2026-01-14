@@ -9,10 +9,10 @@ This project implements **Functorial Sheaf Learning (FSL)** to model the stock m
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
 - [Hierarchical Sheaf Networks (FSL)](#hierarchical-sheaf-networks-fsl)
-  - [📑 Table of Contents](#-table-of-contents)
+  - [Table of Contents](#table-of-contents)
   - [Cohomology as Alpha](#cohomology-as-alpha)
     - [The Problem with Standard Metrics](#the-problem-with-standard-metrics)
     - [The Solution: $H^1$ Cohomology](#the-solution-h1-cohomology)
